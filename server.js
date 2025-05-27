@@ -56,14 +56,12 @@ async function hashPassword(password) {
 }
 
 async function verifyPassword(password, hash) {
-    // 對於模擬資料，我們創建正確的密碼雜湊
-    if (hash.startsWith('$2a$12$rQZ3QJ3qCjFJ8Vg.VPZ1qe')) {
-        return password === 'SecureAdmin2024!';
+    try {
+        return await bcrypt.compare(password, hash);
+    } catch (error) {
+        console.error('密碼驗證錯誤:', error);
+        return false;
     }
-    if (hash.startsWith('$2a$12$8vK2J5qF4P9.kR8xL2wGfH')) {
-        return password === 'Demo123!';
-    }
-    return await bcrypt.compare(password, hash);
 }
 
 function generateJWT(user) {
@@ -100,37 +98,93 @@ function parsePostData(req) {
     });
 }
 
-// 資料庫查詢函數 (目前使用模擬資料，稍後改為真實 SQL)
+// 真實的 Azure SQL 資料庫查詢函數
 const userQueries = {
     async findByUsernameOrEmail(identifier) {
-        // 模擬查詢
-        for (let [key, user] of mockUsers) {
-            if (user.username === identifier || user.email === identifier) {
-                return user;
-            }
+        try {
+            const pool = await sql.connect(dbConfig);
+            const result = await pool.request()
+                .input('identifier', sql.NVarChar, identifier)
+                .query(`
+                    SELECT id, username, email, password_hash, role, is_active, 
+                           login_attempts, locked_until, last_login, created_at
+                    FROM Users 
+                    WHERE (username = @identifier OR email = @identifier) 
+                    AND is_active = 1
+                `);
+            return result.recordset[0];
+        } catch (error) {
+            console.error('資料庫查詢錯誤:', error);
+            throw error;
         }
-        return null;
-        
-        // TODO: 真實 SQL 查詢
-        // const pool = await sql.connect(dbConfig);
-        // const result = await pool.request()
-        //     .input('identifier', sql.NVarChar, identifier)
-        //     .query('SELECT * FROM Users WHERE username = @identifier OR email = @identifier');
-        // return result.recordset[0];
     },
 
     async updateLoginAttempts(userId, success = true) {
-        // 模擬更新
-        for (let [key, user] of mockUsers) {
-            if (user.id === userId) {
-                if (success) {
-                    user.login_attempts = 0;
-                    user.last_login = new Date().toISOString();
-                } else {
-                    user.login_attempts = (user.login_attempts || 0) + 1;
-                }
-                break;
+        try {
+            const pool = await sql.connect(dbConfig);
+            if (success) {
+                await pool.request()
+                    .input('userId', sql.Int, userId)
+                    .query(`
+                        UPDATE Users 
+                        SET login_attempts = 0, 
+                            last_login = GETDATE(),
+                            locked_until = NULL
+                        WHERE id = @userId
+                    `);
+            } else {
+                await pool.request()
+                    .input('userId', sql.Int, userId)
+                    .query(`
+                        UPDATE Users 
+                        SET login_attempts = login_attempts + 1,
+                            locked_until = CASE 
+                                WHEN login_attempts >= 4 THEN DATEADD(MINUTE, 15, GETDATE())
+                                ELSE locked_until 
+                            END
+                        WHERE id = @userId
+                    `);
             }
+        } catch (error) {
+            console.error('更新登入嘗試錯誤:', error);
+            throw error;
+        }
+    },
+
+    async create(userData) {
+        try {
+            const pool = await sql.connect(dbConfig);
+            const result = await pool.request()
+                .input('username', sql.NVarChar, userData.username)
+                .input('email', sql.NVarChar, userData.email)
+                .input('password_hash', sql.NVarChar, userData.password_hash)
+                .input('role', sql.NVarChar, userData.role || 'user')
+                .query(`
+                    INSERT INTO Users (username, email, password_hash, role)
+                    OUTPUT INSERTED.id, INSERTED.username, INSERTED.email, INSERTED.created_at
+                    VALUES (@username, @email, @password_hash, @role)
+                `);
+            return result.recordset[0];
+        } catch (error) {
+            console.error('創建用戶錯誤:', error);
+            throw error;
+        }
+    },
+
+    async findById(id) {
+        try {
+            const pool = await sql.connect(dbConfig);
+            const result = await pool.request()
+                .input('id', sql.Int, id)
+                .query(`
+                    SELECT id, username, email, role, created_at, last_login
+                    FROM Users 
+                    WHERE id = @id AND is_active = 1
+                `);
+            return result.recordset[0];
+        } catch (error) {
+            console.error('查找用戶錯誤:', error);
+            throw error;
         }
     }
 };
@@ -635,4 +689,8 @@ server.listen(PORT, () => {
     console.log(`   - ${process.env.APP_URL || `http://localhost:${PORT}`}/dashboard (控制台)`);
     console.log('');
     console.log('📋 下一步: 設定 Azure SQL Database');
+    console.log('🎉 ========================================');
+    console.log('🚀 SecureApp 生產版啟動成功！');
+    console.log(`📍 https://loginapp-cegcdrf9e9cgdsf9.eastasia-01.azurewebsites.net`);
+    console.log('🔄 GitHub 自動部署已啟用！'); // ← 添加這行
 });
