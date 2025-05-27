@@ -1,0 +1,22 @@
+{
+  "name": "secure-app",
+  "version": "1.0.0",
+  "description": "企業級安全登入系統",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": ["nodejs", "authentication", "azure", "jwt", "security"],
+  "author": "你的名字",
+  "license": "MIT",
+  "dependencies": {
+    "mssql": "^9.1.1",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.0",
+    "dotenv": "^16.0.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
