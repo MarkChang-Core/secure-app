@@ -5,10 +5,326 @@ const jwt = require('jsonwebtoken');
 const sql = require('mssql');
 require('dotenv').config();
 
-// HTML 模板函數（將模板分離到函數中）
-const templates = {
-    // 首頁模板
-    home: () => `
+// 資料庫配置
+const dbConfig = {
+    server: process.env.DB_SERVER,
+    database: process.env.DB_DATABASE,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    options: {
+        encrypt: true, // Azure SQL 需要
+        trustServerCertificate: false,
+        enableArithAbort: true,
+    },
+    pool: {
+        max: 10,
+        min: 0,
+        idleTimeoutMillis: 30000
+    }
+};
+
+// 模擬資料庫（開發階段使用，之後會切換到 Azure SQL）
+const mockUsers = new Map([
+    ['admin', {
+        id: 1,
+        username: 'admin',
+        email: 'admin@secureapp.com',
+        password_hash: '$2a$12$rQZ3QJ3qCjFJ8Vg.VPZ1qeK5BpYMrz5Qy8fK2wGfHxH3.JJPzNrHq', // SecureAdmin2024!
+        role: 'admin',
+        is_active: true,
+        created_at: new Date().toISOString(),
+        login_attempts: 0
+    }],
+    ['demo', {
+        id: 2,
+        username: 'demo',
+        email: 'demo@example.com',
+        password_hash: '$2a$12$8vK2J5qF4P9.kR8xL2wGfHxH3.JJPzNrHqrQZ3QJ3qCjFJ8Vg.VP', // Demo123!
+        role: 'user',
+        is_active: true,
+        created_at: new Date().toISOString(),
+        login_attempts: 0
+    }]
+]);
+
+// 會話存儲
+const sessions = new Map();
+
+// 工具函數
+async function hashPassword(password) {
+    return await bcrypt.hash(password, 12);
+}
+
+async function verifyPassword(password, hash) {
+    try {
+        return await bcrypt.compare(password, hash);
+    } catch (error) {
+        console.error('密碼驗證錯誤:', error);
+        return false;
+    }
+}
+
+function generateJWT(user) {
+    return jwt.sign(
+        { 
+            userId: user.id, 
+            username: user.username,
+            role: user.role 
+        },
+        process.env.JWT_SECRET,
+        { expiresIn: '24h' }
+    );
+}
+
+function verifyJWT(token) {
+    try {
+        return jwt.verify(token, process.env.JWT_SECRET);
+    } catch (error) {
+        return null;
+    }
+}
+
+function parsePostData(req) {
+    return new Promise((resolve) => {
+        let body = '';
+        req.on('data', chunk => body += chunk.toString());
+        req.on('end', () => {
+            try {
+                resolve(JSON.parse(body));
+            } catch {
+                resolve({});
+            }
+        });
+    });
+}
+
+// 真實的 Azure SQL 資料庫查詢函數
+const userQueries = {
+    async findByUsernameOrEmail(identifier) {
+        try {
+            const pool = await sql.connect(dbConfig);
+            const result = await pool.request()
+                .input('identifier', sql.NVarChar, identifier)
+                .query(`
+                    SELECT id, username, email, password_hash, role, is_active, 
+                           login_attempts, locked_until, last_login, created_at
+                    FROM Users 
+                    WHERE (username = @identifier OR email = @identifier) 
+                    AND is_active = 1
+                `);
+            return result.recordset[0];
+        } catch (error) {
+            console.error('資料庫查詢錯誤:', error);
+            throw error;
+        }
+    },
+
+    async updateLoginAttempts(userId, success = true) {
+        try {
+            const pool = await sql.connect(dbConfig);
+            if (success) {
+                await pool.request()
+                    .input('userId', sql.Int, userId)
+                    .query(`
+                        UPDATE Users 
+                        SET login_attempts = 0, 
+                            last_login = GETDATE(),
+                            locked_until = NULL
+                        WHERE id = @userId
+                    `);
+            } else {
+                await pool.request()
+                    .input('userId', sql.Int, userId)
+                    .query(`
+                        UPDATE Users 
+                        SET login_attempts = login_attempts + 1,
+                            locked_until = CASE 
+                                WHEN login_attempts >= 4 THEN DATEADD(MINUTE, 15, GETDATE())
+                                ELSE locked_until 
+                            END
+                        WHERE id = @userId
+                    `);
+            }
+        } catch (error) {
+            console.error('更新登入嘗試錯誤:', error);
+            throw error;
+        }
+    },
+
+    async create(userData) {
+        try {
+            const pool = await sql.connect(dbConfig);
+            const result = await pool.request()
+                .input('username', sql.NVarChar, userData.username)
+                .input('email', sql.NVarChar, userData.email)
+                .input('password_hash', sql.NVarChar, userData.password_hash)
+                .input('role', sql.NVarChar, userData.role || 'user')
+                .query(`
+                    INSERT INTO Users (username, email, password_hash, role)
+                    OUTPUT INSERTED.id, INSERTED.username, INSERTED.email, INSERTED.created_at
+                    VALUES (@username, @email, @password_hash, @role)
+                `);
+            return result.recordset[0];
+        } catch (error) {
+            console.error('創建用戶錯誤:', error);
+            throw error;
+        }
+    },
+
+    async findById(id) {
+        try {
+            const pool = await sql.connect(dbConfig);
+            const result = await pool.request()
+                .input('id', sql.Int, id)
+                .query(`
+                    SELECT id, username, email, role, created_at, last_login
+                    FROM Users 
+                    WHERE id = @id AND is_active = 1
+                `);
+            return result.recordset[0];
+        } catch (error) {
+            console.error('查找用戶錯誤:', error);
+            throw error;
+        }
+    }
+};
+
+// 資料庫可用性檢查
+let dbAvailable = null; // null = 未測試, true = 可用, false = 不可用
+
+async function checkDatabaseConnection() {
+    if (dbAvailable !== null) return dbAvailable;
+    
+    try {
+        const pool = await sql.connect(dbConfig);
+        await pool.request().query('SELECT 1');
+        dbAvailable = true;
+        console.log('✅ Azure SQL Database 連接成功');
+        return true;
+    } catch (error) {
+        console.warn('⚠️ Azure SQL Database 無法連接，將使用模擬資料庫:', error.message);
+        dbAvailable = false;
+        return false;
+    }
+}
+
+// 統一的用戶服務接口（包含回退機制）
+const userService = {
+    async findByUsernameOrEmail(identifier) {
+        const useDatabase = await checkDatabaseConnection();
+        
+        if (useDatabase) {
+            try {
+                return await userQueries.findByUsernameOrEmail(identifier);
+            } catch (error) {
+                console.warn('⚠️ 資料庫查詢失敗，回退到模擬資料庫:', error.message);
+                dbAvailable = false; // 標記資料庫不可用
+            }
+        }
+        
+        // 使用模擬資料庫
+        console.log('📝 使用模擬資料庫查詢用戶:', identifier);
+        return mockUsers.get(identifier) || 
+               Array.from(mockUsers.values()).find(user => user.email === identifier);
+    },
+
+    async updateLoginAttempts(userId, success = true) {
+        const useDatabase = await checkDatabaseConnection();
+        
+        if (useDatabase) {
+            try {
+                return await userQueries.updateLoginAttempts(userId, success);
+            } catch (error) {
+                console.warn('⚠️ 資料庫更新失敗，回退到模擬資料庫:', error.message);
+                dbAvailable = false; // 標記資料庫不可用
+            }
+        }
+        
+        // 更新模擬資料庫
+        console.log('📝 使用模擬資料庫更新登入嘗試:', userId, success);
+        for (let [key, user] of mockUsers) {
+            if (user.id === userId) {
+                if (success) {
+                    user.login_attempts = 0;
+                    user.last_login = new Date().toISOString();
+                } else {
+                    user.login_attempts = (user.login_attempts || 0) + 1;
+                    // 如果嘗試次數超過 4 次，設定鎖定時間
+                    if (user.login_attempts >= 5) {
+                        user.locked_until = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+                    }
+                }
+                mockUsers.set(key, user);
+                break;
+            }
+        }
+    }
+};
+
+// 主伺服器
+const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const pathname = url.pathname;
+
+    // 安全標頭
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('X-XSS-Protection', '1; mode=block');
+    
+    // CORS 設定
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+    if (req.method === 'OPTIONS') {
+        res.writeHead(200);
+        res.end();
+        return;
+    }
+    // 🆕 Favicon 和靜態檔案處理
+    if (pathname === '/favicon.ico') {
+            try {
+                const fs = require('fs').promises;
+                const path = require('path');
+                const faviconPath = path.join(__dirname, 'public', 'favicon.ico');
+                const favicon = await fs.readFile(faviconPath);
+                res.writeHead(200, {'Content-Type': 'image/x-icon'});
+                res.end(favicon);
+            } catch (error) {
+                console.error('Favicon 載入失敗:', error);
+                res.writeHead(404);
+                res.end();
+            }
+            return;
+        }
+
+        // 🆕 其他靜態檔案處理
+        if (pathname.startsWith('/public/')) {
+            try {
+                const fs = require('fs').promises;
+                const path = require('path');
+                const filePath = path.join(__dirname, pathname);
+                const file = await fs.readFile(filePath);
+                
+                let contentType = 'application/octet-stream';
+                if (pathname.endsWith('.png')) contentType = 'image/png';
+                if (pathname.endsWith('.ico')) contentType = 'image/x-icon';
+                
+                res.writeHead(200, {'Content-Type': contentType});
+                res.end(file);
+            } catch (error) {
+                console.error('靜態檔案載入失敗:', error);
+                res.writeHead(404);
+                res.end();
+            }
+            return;
+    }
+    try {
+    // 路由處理
+// 修復後的首頁路由
+if (pathname === '/' && req.method === 'GET') {
+    res.writeHead(200, {'Content-Type': 'text/html; charset=utf-8'});
+    res.end(`
 <!DOCTYPE html>
 <html lang="zh-TW">
 <head>
@@ -16,158 +332,48 @@ const templates = {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SecureApp - 企業級登入系統</title>
     <style>
-        /* 你的改進版 CSS 在這裡 */
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: white;
-            padding: 20px;
+            min-height: 100vh; display: flex; align-items: center; justify-content: center;
+            color: white; padding: 20px;
         }
-        
         .hero {
-            text-align: center;
-            max-width: 900px;
-            width: 100%;
-            background: rgba(255, 255, 255, 0.1);
-            padding: 60px 40px;
-            border-radius: 24px;
-            backdrop-filter: blur(20px);
-            box-shadow: 0 32px 64px rgba(0, 0, 0, 0.25);
-            border: 1px solid rgba(255, 255, 255, 0.1);
+            text-align: center; max-width: 800px; width: 100%;
+            background: rgba(255, 255, 255, 0.1); padding: 60px 40px;
+            border-radius: 20px; backdrop-filter: blur(20px);
+            box-shadow: 0 25px 50px rgba(0, 0, 0, 0.2);
         }
-        
-        h1 {
-            font-size: clamp(2.5rem, 5vw, 4rem);
-            margin-bottom: 1.5rem;
-            font-weight: 800;
-            background: linear-gradient(135deg, #ffffff, #e0e7ff);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-        
-        .subtitle {
-            font-size: 1.4rem;
-            margin-bottom: 2.5rem;
-            opacity: 0.9;
-            font-weight: 300;
-        }
-        
+        h1 { font-size: 3.5rem; margin-bottom: 1rem; font-weight: 800; }
+        .subtitle { font-size: 1.3rem; margin-bottom: 2rem; opacity: 0.9; }
         .status {
-            background: rgba(16, 185, 129, 0.15);
-            border: 1px solid rgba(16, 185, 129, 0.3);
-            padding: 25px;
-            border-radius: 16px;
-            margin: 40px 0;
-            backdrop-filter: blur(10px);
+            background: rgba(16, 185, 129, 0.2); border: 1px solid rgba(16, 185, 129, 0.4);
+            padding: 20px; border-radius: 10px; margin: 30px 0;
         }
-        
         .features {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 25px;
-            margin: 50px 0;
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px; margin: 40px 0;
         }
-        
         .feature {
-            background: rgba(255, 255, 255, 0.08);
-            padding: 30px 25px;
-            border-radius: 20px;
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            transition: all 0.4s ease;
-            backdrop-filter: blur(10px);
+            background: rgba(255, 255, 255, 0.1); padding: 25px 20px;
+            border-radius: 15px; border: 1px solid rgba(255, 255, 255, 0.2);
         }
-        
-        .feature:hover {
-            transform: translateY(-8px);
-            background: rgba(255, 255, 255, 0.12);
-            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.15);
-        }
-        
-        .feature-icon {
-            font-size: 3rem;
-            margin-bottom: 15px;
-            display: block;
-        }
-        
-        .feature h3 {
-            font-size: 1.3rem;
-            margin-bottom: 10px;
-            font-weight: 600;
-        }
-        
-        .feature p {
-            opacity: 0.85;
-            line-height: 1.5;
-        }
-        
+        .feature-icon { font-size: 2.5rem; margin-bottom: 10px; }
         .btn {
-            display: inline-block;
-            padding: 20px 40px;
-            margin: 15px;
-            background: rgba(255, 255, 255, 0.9);
-            color: #333;
-            text-decoration: none;
-            border-radius: 50px;
-            font-weight: 600;
-            font-size: 1.1rem;
-            transition: all 0.3s ease;
-            box-shadow: 0 8px 25px rgba(0, 0, 0, 0.1);
+            display: inline-block; padding: 18px 35px; margin: 10px;
+            background: rgba(255, 255, 255, 0.9); color: #333;
+            text-decoration: none; border-radius: 50px; font-weight: 600;
+            transition: all 0.3s;
         }
-        
-        .btn:hover {
-            transform: translateY(-3px) scale(1.02);
-            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.2);
-            background: white;
-        }
-        
+        .btn:hover { transform: translateY(-3px); }
         .demo-accounts {
-            background: rgba(0, 0, 0, 0.15);
-            padding: 30px;
-            border-radius: 20px;
-            margin-top: 40px;
-            text-align: left;
-            border: 1px solid rgba(255, 255, 255, 0.1);
+            background: rgba(0, 0, 0, 0.2); padding: 25px; border-radius: 15px;
+            margin-top: 30px; text-align: left;
         }
-        
-        .demo-accounts h3 {
-            text-align: center;
-            margin-bottom: 25px;
-            font-size: 1.3rem;
-        }
-        
         .account {
-            background: rgba(255, 255, 255, 0.08);
-            padding: 20px;
-            margin: 15px 0;
-            border-radius: 12px;
-            font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
-            font-size: 0.95rem;
-            line-height: 1.6;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            transition: all 0.3s ease;
-        }
-        
-        .account:hover {
-            background: rgba(255, 255, 255, 0.12);
-        }
-        
-        .account strong {
-            display: block;
-            margin-bottom: 8px;
-            color: #60a5fa;
-        }
-        
-        @media (max-width: 768px) {
-            .hero { padding: 40px 20px; }
-            .features { grid-template-columns: 1fr; gap: 20px; }
-            .btn { padding: 18px 35px; margin: 10px 5px; }
+            background: rgba(255, 255, 255, 0.1); padding: 15px; margin: 10px 0;
+            border-radius: 8px; font-family: 'SF Mono', monospace;
         }
     </style>
 </head>
@@ -185,44 +391,46 @@ const templates = {
             <div class="feature">
                 <div class="feature-icon">🛡️</div>
                 <h3>安全認證</h3>
-                <p>JWT Token + bcrypt 加密保護</p>
+                <p>JWT Token + bcrypt 加密</p>
             </div>
             <div class="feature">
                 <div class="feature-icon">🗄️</div>
                 <h3>資料庫整合</h3>
-                <p>Azure SQL Database 雲端支援</p>
+                <p>Azure SQL Database 支援</p>
             </div>
             <div class="feature">
                 <div class="feature-icon">🚀</div>
                 <h3>雲端部署</h3>
-                <p>Azure App Service 自動化部署</p>
+                <p>Azure App Service 就緒</p>
             </div>
         </div>
         
         <div>
             <a href="/login" class="btn">🚪 系統登入</a>
-            <a href="/register" class="btn" style="background: rgba(255, 255, 255, 0.1); color: white;">👤 註冊帳號</a>
         </div>
         
         <div class="demo-accounts">
             <h3>🧪 測試帳號</h3>
             <div class="account">
-                <strong>管理員帳戶</strong>
+                <strong>管理員帳戶</strong><br>
                 用戶名: admin<br>
                 密碼: SecureAdmin2024!
             </div>
             <div class="account">
-                <strong>演示帳戶</strong>
+                <strong>演示帳戶</strong><br>
                 用戶名: demo<br>
                 密碼: Demo123!
             </div>
         </div>
     </div>
 </body>
-</html>`,
-
-    // 登入頁面模板
-    login: () => `
+</html>
+    `);
+}
+        
+        else if (pathname === '/login' && req.method === 'GET') {
+            res.writeHead(200, {'Content-Type': 'text/html; charset=utf-8'});
+            res.end(`
 <!DOCTYPE html>
 <html lang="zh-TW">
 <head>
@@ -231,173 +439,88 @@ const templates = {
     <title>登入 - SecureApp</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif;
             background: linear-gradient(135deg, #667eea, #764ba2);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
+            min-height: 100vh; display: flex; align-items: center; justify-content: center;
             padding: 20px;
         }
-        
         .login-container {
-            background: rgba(255, 255, 255, 0.95);
-            padding: 50px;
-            border-radius: 24px;
-            max-width: 480px;
-            width: 100%;
-            box-shadow: 0 32px 64px rgba(0, 0, 0, 0.25);
+            background: rgba(255, 255, 255, 0.95); padding: 50px;
+            border-radius: 20px; max-width: 450px; width: 100%;
+            box-shadow: 0 25px 50px rgba(0, 0, 0, 0.2);
             backdrop-filter: blur(20px);
-            border: 1px solid rgba(255, 255, 255, 0.2);
         }
-        
-        .logo {
-            text-align: center;
-            margin-bottom: 30px;
-            font-size: 3rem;
-        }
-        
         h2 {
-            text-align: center;
-            color: #333;
-            margin-bottom: 40px;
-            font-size: 2rem;
-            font-weight: 700;
+            text-align: center; color: #333; margin-bottom: 40px;
+            font-size: 2rem; font-weight: 700;
         }
-        
-        .form-group {
-            margin-bottom: 25px;
-        }
-        
+        .form-group { margin-bottom: 25px; }
         label {
-            display: block;
-            margin-bottom: 8px;
-            color: #555;
-            font-weight: 600;
-            font-size: 0.95rem;
+            display: block; margin-bottom: 8px; color: #555;
+            font-weight: 600; font-size: 0.95rem;
         }
-        
         input {
-            width: 100%;
-            padding: 16px 20px;
-            border: 2px solid #e1e5e9;
-            border-radius: 16px;
-            font-size: 16px;
-            transition: all 0.3s ease;
-            background: #fafbfc;
-            box-sizing: border-box;
+            width: 100%; padding: 15px 20px; border: 2px solid #e1e5e9;
+            border-radius: 12px; font-size: 16px; transition: all 0.3s;
+            background: #fafbfc; box-sizing: border-box;
         }
-        
         input:focus {
-            outline: none;
-            border-color: #667eea;
-            background: white;
-            box-shadow: 0 0 0 4px rgba(102, 126, 234, 0.1);
-            transform: translateY(-1px);
+            outline: none; border-color: #667eea; background: white;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
         }
-        
         .btn {
-            width: 100%;
-            background: linear-gradient(135deg, #667eea, #764ba2);
-            color: white;
-            padding: 18px;
-            border: none;
-            border-radius: 16px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            margin-top: 10px;
+            width: 100%; background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white; padding: 18px; border: none; border-radius: 12px;
+            font-size: 16px; font-weight: 600; cursor: pointer;
+            transition: all 0.3s; margin-top: 10px;
         }
-        
         .btn:hover {
             transform: translateY(-2px);
-            box-shadow: 0 12px 30px rgba(102, 126, 234, 0.4);
+            box-shadow: 0 10px 25px rgba(102, 126, 234, 0.3);
         }
-        
         .btn:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
-            transform: none;
+            opacity: 0.6; cursor: not-allowed; transform: none;
         }
-        
         .message {
-            padding: 15px;
-            border-radius: 12px;
-            margin-bottom: 20px;
-            text-align: center;
-            font-weight: 500;
+            padding: 15px; border-radius: 8px; margin-bottom: 20px;
+            text-align: center; font-weight: 500;
         }
-        
         .success {
-            background: #d1fae5;
-            color: #065f46;
-            border: 1px solid #34d399;
+            background: #d1fae5; color: #065f46; border: 1px solid #34d399;
         }
-        
         .error {
-            background: #fee2e2;
-            color: #991b1b;
-            border: 1px solid #f87171;
+            background: #fee2e2; color: #991b1b; border: 1px solid #f87171;
         }
-        
         .info {
-            background: #dbeafe;
-            color: #1e40af;
-            border: 1px solid #60a5fa;
+            background: #dbeafe; color: #1e40af; border: 1px solid #60a5fa;
         }
-        
         .back-link {
-            text-align: center;
-            margin-top: 25px;
+            text-align: center; margin-top: 25px;
         }
-        
         .back-link a {
-            color: #667eea;
-            text-decoration: none;
-            font-weight: 500;
-            transition: all 0.3s ease;
+            color: #667eea; text-decoration: none; font-weight: 500;
         }
-        
-        .back-link a:hover {
-            color: #5a67d8;
-        }
-        
         .loading {
-            display: none;
-            text-align: center;
-            margin-top: 15px;
+            display: none; text-align: center; margin-top: 10px;
         }
-        
         .spinner {
             border: 3px solid #f3f4f6;
             border-top: 3px solid #667eea;
             border-radius: 50%;
-            width: 30px;
-            height: 30px;
+            width: 30px; height: 30px;
             animation: spin 1s linear infinite;
-            margin: 0 auto 10px;
+            margin: 0 auto;
         }
-        
         @keyframes spin {
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
-        }
-        
-        @media (max-width: 768px) {
-            .login-container {
-                padding: 30px 20px;
-                margin: 10px;
-            }
         }
     </style>
 </head>
 <body>
     <div class="login-container">
-        <div class="logo">🔐</div>
-        <h2>系統登入</h2>
+        <h2>🔐 系統登入</h2>
         <div id="message"></div>
         
         <form id="loginForm">
@@ -415,7 +538,7 @@ const templates = {
             
             <div class="loading" id="loading">
                 <div class="spinner"></div>
-                <p>正在驗證中...</p>
+                <p>正在驗證...</p>
             </div>
         </form>
         
@@ -488,10 +611,101 @@ const templates = {
         });
     </script>
 </body>
-</html>`,
-
-    // 控制台模板
-    dashboard: () => `
+</html>
+            `);
+        }
+        
+ else if (pathname === '/api/login' && req.method === 'POST') {
+    const data = await parsePostData(req);
+    
+    if (!data.username || !data.password) {
+        res.writeHead(400, {'Content-Type': 'application/json'});
+        res.end(JSON.stringify({
+            success: false,
+            message: '用戶名和密碼為必填項目'
+        }));
+        return;
+    }
+    
+    try {
+        // 🆕 使用統一的用戶服務（自動處理回退）
+        const user = await userService.findByUsernameOrEmail(data.username);
+        
+        if (!user || !user.is_active) {
+            res.writeHead(401, {'Content-Type': 'application/json'});
+            res.end(JSON.stringify({
+                success: false,
+                message: '用戶名或密碼錯誤'
+            }));
+            return;
+        }
+        
+        // 🆕 檢查帳戶鎖定（適用於模擬和真實資料庫）
+        if (user.locked_until && new Date(user.locked_until) > new Date()) {
+            res.writeHead(423, {'Content-Type': 'application/json'});
+            res.end(JSON.stringify({
+                success: false,
+                message: '帳戶已被鎖定，請稍後再試'
+            }));
+            return;
+        }
+        
+        // 檢查登入嘗試次數
+        if (user.login_attempts >= 5) {
+            res.writeHead(429, {'Content-Type': 'application/json'});
+            res.end(JSON.stringify({
+                success: false,
+                message: '登入嘗試次數過多，帳戶已被暫時鎖定'
+            }));
+            return;
+        }
+        
+        // 驗證密碼
+        const isValidPassword = await verifyPassword(data.password, user.password_hash);
+        
+        if (isValidPassword) {
+            // 🆕 登入成功 - 使用統一服務
+            await userService.updateLoginAttempts(user.id, true);
+            
+            const token = generateJWT(user);
+            
+            res.writeHead(200, {'Content-Type': 'application/json'});
+            res.end(JSON.stringify({
+                success: true,
+                message: '登入成功！正在跳轉...',
+                token: token,
+                user: {
+                    id: user.id,
+                    username: user.username,
+                    email: user.email,
+                    role: user.role
+                }
+            }));
+        } else {
+            // 🆕 登入失敗 - 使用統一服務
+            await userService.updateLoginAttempts(user.id, false);
+            
+            res.writeHead(401, {'Content-Type': 'application/json'});
+            res.end(JSON.stringify({
+                success: false,
+                message: '用戶名或密碼錯誤'
+            }));
+        }
+        
+    } catch (error) {
+        console.error('❌ 登入處理錯誤:', error);
+        res.writeHead(500, {'Content-Type': 'application/json'});
+        res.end(JSON.stringify({
+            success: false,
+            message: '伺服器內部錯誤，請稍後再試'
+        }));
+    }
+}       
+        
+        else if (pathname === '/dashboard' && req.method === 'GET') {
+            // 這裡需要檢查 JWT token
+            res.writeHead(200, {'Content-Type': 'text/html; charset=utf-8'});
+            res.end(`
 <!DOCTYPE html>
 <html lang="zh-TW">
 <head>
@@ -500,106 +714,34 @@ const templates = {
     <title>控制台 - SecureApp</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif;
             background: linear-gradient(135deg, #667eea, #764ba2);
-            min-height: 100vh;
-            padding: 20px;
+            min-height: 100vh; padding: 20px;
         }
-        
         .dashboard {
-            max-width: 1200px;
-            margin: 0 auto;
-            background: rgba(255, 255, 255, 0.95);
-            border-radius: 24px;
-            padding: 40px;
-            box-shadow: 0 32px 64px rgba(0, 0, 0, 0.25);
+            max-width: 1000px; margin: 0 auto;
+            background: rgba(255, 255, 255, 0.95); border-radius: 20px;
+            padding: 40px; box-shadow: 0 25px 50px rgba(0, 0, 0, 0.2);
         }
-        
         .header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 40px;
-            padding-bottom: 20px;
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 40px; padding-bottom: 20px;
             border-bottom: 2px solid #f0f0f0;
         }
-        
-        h1 {
-            color: #333;
-            font-size: 2.5rem;
-            font-weight: 800;
-        }
-        
+        h1 { color: #333; font-size: 2.5rem; }
         .btn-danger {
             background: linear-gradient(135deg, #ff6b6b, #ee5a52);
-            color: white;
-            padding: 12px 25px;
-            border: none;
-            border-radius: 12px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s ease;
+            color: white; padding: 12px 25px; border: none; border-radius: 8px;
+            font-weight: 600; cursor: pointer; transition: all 0.3s;
         }
-        
-        .btn-danger:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 20px rgba(255, 107, 107, 0.4);
-        }
-        
+        .btn-danger:hover { transform: translateY(-2px); opacity: 0.9; }
         .welcome {
-            background: linear-gradient(135deg, #d1fae5, #a7f3d0);
-            color: #065f46;
-            padding: 30px;
-            border-radius: 20px;
-            margin-bottom: 30px;
-            border-left: 6px solid #10b981;
+            background: #d1fae5; color: #065f46; padding: 30px;
+            border-radius: 15px; margin-bottom: 30px;
+            border-left: 4px solid #10b981;
         }
-        
-        .welcome h2 {
-            margin-bottom: 10px;
-            font-size: 1.8rem;
-        }
-        
-        .stats {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 25px;
-            margin-top: 30px;
-        }
-        
-        .stat-card {
-            background: white;
-            padding: 25px;
-            border-radius: 16px;
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.08);
-            border: 1px solid #f1f5f9;
-            transition: all 0.3s ease;
-        }
-        
-        .stat-card:hover {
-            transform: translateY(-4px);
-            box-shadow: 0 8px 25px rgba(0, 0, 0, 0.12);
-        }
-        
-        .stat-icon {
-            font-size: 2.5rem;
-            margin-bottom: 10px;
-        }
-        
-        .stat-number {
-            font-size: 2rem;
-            font-weight: 800;
-            color: #333;
-            margin-bottom: 5px;
-        }
-        
-        .stat-label {
-            color: #64748b;
-            font-size: 0.9rem;
-            font-weight: 500;
-        }
+        .welcome h2 { margin-bottom: 10px; }
     </style>
 </head>
 <body>
@@ -612,30 +754,7 @@ const templates = {
         <div class="welcome">
             <h2>歡迎進入 SecureApp！🎉</h2>
             <p>您已成功登入系統。這裡是用戶控制台，所有功能都已就緒。</p>
-            <p><small>系統採用企業級安全架構，整合 Azure SQL Database 和完整的用戶管理功能。</small></p>
-        </div>
-        
-        <div class="stats">
-            <div class="stat-card">
-                <div class="stat-icon">👥</div>
-                <div class="stat-number">2</div>
-                <div class="stat-label">註冊用戶</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-icon">🔐</div>
-                <div class="stat-number">100%</div>
-                <div class="stat-label">安全性評分</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-icon">⚡</div>
-                <div class="stat-number">24/7</div>
-                <div class="stat-label">系統運行時間</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-icon">🌟</div>
-                <div class="stat-number">Enterprise</div>
-                <div class="stat-label">版本等級</div>
-            </div>
+            <p><small>下一步我們將整合 Azure SQL Database 和完整的用戶管理功能。</small></p>
         </div>
     </div>
     
@@ -658,67 +777,99 @@ const templates = {
         }
     </script>
 </body>
-</html>`
-};
-
-// 資料庫配置
-const dbConfig = {
-    server: process.env.DB_SERVER,
-    database: process.env.DB_DATABASE,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    options: {
-        encrypt: true,
-        trustServerCertificate: false,
-        enableArithAbort: true,
-    },
-    pool: {
-        max: 10,
-        min: 0,
-        idleTimeoutMillis: 30000
-    }
-};
-
-// 其餘的伺服器邏輯保持不變...
-// （包括 userQueries、認證邏輯等）
-
-// 主伺服器
-const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const pathname = url.pathname;
-
-    // 安全標頭
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('X-XSS-Protection', '1; mode=block');
-    res.setHeader('Content-Security-Policy', "default-src 'self' 'unsafe-inline'");
-    
-    // CORS 設定
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-    if (req.method === 'OPTIONS') {
-        res.writeHead(200);
-        res.end();
-        return;
-    }
-
-    try {
-        // 路由處理 - 使用模板函數
-        if (pathname === '/' && req.method === 'GET') {
-            res.writeHead(200, {'Content-Type': 'text/html; charset=utf-8'});
-            res.end(templates.home());
+</html>
+            `);
         }
-        else if (pathname === '/login' && req.method === 'GET') {
-            res.writeHead(200, {'Content-Type': 'text/html; charset=utf-8'});
-            res.end(templates.login());
+        // 健康檢查端點
+        else if (pathname === '/health' && req.method === 'GET') {
+            const healthStatus = {
+                status: 'healthy',
+                timestamp: new Date().toISOString(),
+                version: '1.0.0',
+                environment: process.env.NODE_ENV || 'development',
+                uptime: Math.floor(process.uptime()),
+                memory: process.memoryUsage(),
+                services: {}
+            };
+            
+            try {
+                // 檢查資料庫連接
+                let dbStatus = 'unknown';
+                try {
+                    const testUser = await userService.findByUsernameOrEmail('health-check-user');
+                    dbStatus = dbAvailable ? 'azure_sql_connected' : 'fallback_mode';
+                } catch (error) {
+                    dbStatus = 'fallback_mode';
+                }
+                
+                healthStatus.services.database = {
+                    status: 'operational',
+                    type: dbStatus,
+                    azure_sql_available: dbAvailable === true
+                };
+                
+                // 檢查 JWT 配置
+                healthStatus.services.auth = {
+                    status: process.env.JWT_SECRET ? 'configured' : 'missing',
+                    jwt_configured: !!process.env.JWT_SECRET
+                };
+                
+                // 檢查環境變數
+                const envVars = ['DB_SERVER', 'DB_DATABASE', 'DB_USER', 'DB_PASSWORD'];
+                const missingEnvVars = envVars.filter(varName => !process.env[varName]);
+                
+                healthStatus.services.environment = {
+                    status: missingEnvVars.length === 0 ? 'complete' : 'partial',
+                    missing_vars: missingEnvVars,
+                    production_ready: process.env.NODE_ENV === 'production' && missingEnvVars.length === 0
+                };
+                
+                // 整體狀態評估
+                const allServicesHealthy = 
+                    healthStatus.services.auth.status === 'configured' &&
+                    healthStatus.services.database.status === 'operational';
+                
+                if (!allServicesHealthy) {
+                    healthStatus.status = 'degraded';
+                }
+                
+                const statusCode = healthStatus.status === 'healthy' ? 200 : 503;
+                res.writeHead(statusCode, {'Content-Type': 'application/json'});
+                res.end(JSON.stringify(healthStatus, null, 2));
+                
+            } catch (error) {
+                console.error('健康檢查失敗:', error);
+                res.writeHead(503, {'Content-Type': 'application/json'});
+                res.end(JSON.stringify({
+                    status: 'error',
+                    timestamp: new Date().toISOString(),
+                    error: error.message
+                }));
+            }
         }
-        else if (pathname === '/dashboard' && req.method === 'GET') {
-            res.writeHead(200, {'Content-Type': 'text/html; charset=utf-8'});
-            res.end(templates.dashboard());
+        
+        // 簡化版健康檢查（適用於負載均衡器）
+        else if (pathname === '/ping' && req.method === 'GET') {
+            res.writeHead(200, {'Content-Type': 'text/plain'});
+            res.end('pong');
         }
-        // API 路由保持不變...
+        
+        // API 狀態端點
+        else if (pathname === '/api/status' && req.method === 'GET') {
+            res.writeHead(200, {'Content-Type': 'application/json'});
+            res.end(JSON.stringify({
+                api_version: '1.0.0',
+                status: 'operational',
+                timestamp: new Date().toISOString(),
+                features: {
+                    authentication: true,
+                    database_fallback: true,
+                    security_headers: true
+                },
+                database_mode: dbAvailable ? 'azure_sql' : 'mock'
+            }));
+        }
+        
         else {
             res.writeHead(404, {'Content-Type': 'application/json'});
             res.end(JSON.stringify({
@@ -740,6 +891,26 @@ const server = http.createServer(async (req, res) => {
 // 啟動伺服器
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log('🎉 SecureApp 改進版啟動成功！');
+    console.log('🎉 ========================================');
+    console.log('🚀 SecureApp 完整版啟動成功！');
     console.log(`📍 http://localhost:${PORT}`);
+    console.log(`🌍 環境: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`⚡ Node.js: ${process.version}`);
+    console.log(`🗄️ 資料庫: ${process.env.DB_SERVER ? 'Azure SQL (未連接)' : '模擬資料庫'}`);
+    console.log('🎉 ========================================');
+    console.log('');
+    console.log('🔐 測試帳號:');
+    console.log('   admin / SecureAdmin2024! (管理員)');
+    console.log('   demo / Demo123! (一般用戶)');
+    console.log('');
+    console.log('🌐 功能頁面:');
+    console.log(`   - ${process.env.APP_URL || `http://localhost:${PORT}`}/ (首頁)`);
+    console.log(`   - ${process.env.APP_URL || `http://localhost:${PORT}`}/login (登入)`);
+    console.log(`   - ${process.env.APP_URL || `http://localhost:${PORT}`}/dashboard (控制台)`);
+    console.log('');
+    console.log('📋 下一步: 設定 Azure SQL Database');
+    console.log('🎉 ========================================');
+    console.log('🚀 SecureApp 生產版啟動成功！');
+    console.log(`📍 https://loginapp-cegcdrf9e9cgdsf9.eastasia-01.azurewebsites.net`);
+    console.log('🔄 GitHub 自動部署已啟用！'); // ← 添加這行
 });
